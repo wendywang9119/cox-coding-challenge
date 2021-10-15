@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
 using IO.Swagger.Api;
@@ -12,58 +14,69 @@ namespace MainApp
     {
         static void Main(string[] args)
         {
-            AnswerResponse answerResponse = GetAnswerResponse();
+            AnswerResponse answerResponse = GetAnswerResponse().Result;
             Console.WriteLine("Retrieving the data...");
             Console.WriteLine(answerResponse);
             Console.ReadKey();
         }
 
-        private static AnswerResponse GetAnswerResponse()
-        {
-            string basePath = "http://api.coxauto-interview.com";
+        static readonly string basePath = "http://api.coxauto-interview.com";
 
+        static async Task<AnswerResponse> GetAnswerResponse()
+        {
             // get dataSetId
             DataSetApi dataSetApi = new DataSetApi(basePath);
             string dataSetId = dataSetApi.GetDataSetId().DatasetId;
 
             // get all vehicleIds by dataSetId
             VehiclesApi vehiclesApi = new VehiclesApi(basePath);
-            List<int?> vehicleIds = vehiclesApi.GetIds(dataSetId).VehicleIds;
+            var vehicleIds = vehiclesApi.GetIds(dataSetId).VehicleIds;
 
-            Dictionary<int?, DealerAnswer> dic = new Dictionary<int?, DealerAnswer>();
-            // iterate the list of vehicleIds
+            var stopwatch = Stopwatch.StartNew();
+
+            List<Task<VehicleResponse>> vehicleTasks = new List<Task<VehicleResponse>>();
+            // create a list of tasks so we can call vehicle api at same time
             foreach (var vehicleId in vehicleIds)
             {
-                // get vehicle
-                VehicleResponse vehicleResponse = vehiclesApi.GetVehicle(dataSetId, vehicleId);
-                int? dealerId = vehicleResponse.DealerId;
-                // when dictionary doesn't have the key
-                if (!dic.ContainsKey(dealerId))
-                {
-                    List<VehicleAnswer> vehicleAnswers = new List<VehicleAnswer>();
-                    vehicleAnswers.Add(new VehicleAnswer(vehicleResponse.VehicleId, vehicleResponse.Year, vehicleResponse.Make, vehicleResponse.Model));
-                    // get dealer
-                    DealersApi dealersApi = new DealersApi(basePath);
-                    DealersResponse dealersResponse = dealersApi.GetDealer(dataSetId, dealerId);
-                    DealerAnswer dealerAnswer = new DealerAnswer(dealersResponse.DealerId, dealersResponse.Name, vehicleAnswers);
-                    dic.Add(dealerId, dealerAnswer);
-                }
-                else
-                {
-                    // get value of current key
-                    List<VehicleAnswer> existingVehicleList = dic[dealerId].Vehicles;
-                    existingVehicleList.Add(new VehicleAnswer(vehicleResponse.VehicleId, vehicleResponse.Year, vehicleResponse.Make, vehicleResponse.Model));
-                }
+                vehicleTasks.Add(vehiclesApi.GetVehicleAsync(dataSetId, vehicleId));
             }
+
+            List<Task<DealersResponse>> dealerTasks = new List<Task<DealersResponse>>();
+            Dictionary<int?, List<VehicleAnswer>> dict = new Dictionary<int?, List<VehicleAnswer>>(); // key = dealerId, value = listOfVehicles
+            while (vehicleTasks.Any())
+            {
+                Task<VehicleResponse> finishedTask = await Task.WhenAny(vehicleTasks);
+                vehicleTasks.Remove(finishedTask);
+                VehicleResponse response = await finishedTask;
+
+                if (!dict.ContainsKey(response?.DealerId))
+                {
+                    DealersApi dealersApi = new DealersApi(basePath);
+                    dealerTasks.Add(dealersApi.GetDealerAsync(dataSetId, response.DealerId));
+                    dict.Add(response.DealerId, new List<VehicleAnswer>());
+                }
+                
+                dict[response.DealerId].Add(new VehicleAnswer(response.VehicleId, response.Year, response.Make, response.Model));
+            }
+
+            await Task.WhenAll(dealerTasks);
+           
+            List<DealerAnswer> answers = new List<DealerAnswer>();
+            foreach(var task in dealerTasks)
+            {
+                var dealer = await task;
+                answers.Add(new DealerAnswer()
+                {
+                    DealerId = dealer.DealerId,
+                    Name = dealer.Name,
+                    Vehicles = dict[dealer.DealerId]
+                });
+            }
+
+            stopwatch.Stop();
 
             // post to anwser API
-            List<DealerAnswer> dealerAnswers = new List<DealerAnswer>();
-            foreach(KeyValuePair<int?, DealerAnswer> entry in dic)
-            {
-                dealerAnswers.Add(dic[entry.Key]);
-            }
-            Answer answer = new Answer(dealerAnswers);
-
+            Answer answer = new Answer(answers);
             AnswerResponse answerResponse = dataSetApi.PostAnswer(dataSetId, answer);
             return answerResponse;
         }
